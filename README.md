@@ -176,8 +176,65 @@ names and wording, and scores your 3 points only.
 ### My 3 points and rules
 > for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
 
+I picked points 1, 2 and 5. All three are database points, and all three use
+the same shape of rule: compare the company's number with the median of its
+own industry (the `industry_medians` table). Fisher keeps asking "is this
+company doing better than its competitors?", and the medians table is exactly
+that benchmark, so this felt like the most faithful reading of the book.
+
+- **Point 1 (market potential).** Rule: 2-year revenue growth = (FY2025 −
+  FY2023) ÷ FY2023, computed from the `orders` table. PASS if the company's
+  growth is above the industry median (`revenue_growth_2y_pct`). A company
+  outpacing its own industry is the clearest sign of "sufficient market
+  potential ... for a sizable increase in sales".
+- **Point 2 (new products as current lines mature).** Rule: share of FY2025
+  revenue coming from products launched in 2023 or later (orders joined with
+  `products.launch_date`). PASS if above the industry median
+  (`new_product_share_pct`). This captures Fisher's question of whether
+  management is "continuing to develop products" while the old lines are
+  still growing.
+- **Point 5 (worthwhile profit margin).** Rule: FY2025 operating margin =
+  (revenue − cost of sales − selling & admin − R&D) ÷ revenue, from
+  `monthly_costs`. PASS if above the industry median (`operating_margin_pct`).
+  "Worthwhile" has to mean relative to the industry - a 10% margin is great in
+  groceries and terrible in software.
+
 ### Design
 > a visualization of your agent design and one paragraph describing it.
 
+```
+per company (20 in parallel, asyncio.gather)
+│
+├─ sql_query: SELECT industry FROM company
+├─ sql_query: SELECT ... FROM industry_medians WHERE industry = ...
+├─ sql_query: revenue by year (orders)
+├─ sql_query: 2025 revenue split new vs old products (orders ⨝ products)
+├─ sql_query: costs by year (monthly_costs)
+│        └─> Python computes growth_2y, new_share, operating_margin
+│        └─> Python applies the 3 PASS rules  →  verdicts (deterministic)
+│
+└─ one LLM call (deepseek-v4-flash): the numbers + verdicts → 2-3 sentence summary
+```
+
+The main lesson I took from HW2 was not to let the model do arithmetic or
+free-style verdicts, so the design is deliberately boring: the model never
+decides anything. All five SQL queries go through the provided `sql_query`
+tool, every sum, ratio and comparison happens in Python, and the PASS/FAIL
+verdicts come from fixed thresholds against the industry medians - the same
+output on every run. The LLM (created once in `build_agent()`) only gets one
+call per company, to turn the computed numbers and verdicts into a readable
+Fisher-style summary. No interviews are used (0 per company), which also means
+no interview planning to get wrong. Companies are analysed in parallel with
+`asyncio.gather`, each wrapped in try/except so one failure cannot kill the
+run, and the summary call is retried with a plain-text fallback.
+
 ### Results
 > your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+
+Point accuracy on `public_test`: **60/60 verdicts correct, balanced point
+score 100.0%** (20 companies × 3 points; a full run takes about 10-30
+seconds). My verdicts agree with the public answers on all 20 companies, so
+there are no disagreement cases to explain. As a sanity check on how safe the
+rules are, the closest company to a line sits about 3 percentage points above
+or below its industry median on every point, so the verdicts are not
+dependent on a knife-edge threshold.

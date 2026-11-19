@@ -57,7 +57,156 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 2, 5]  ### YOUR CODE HERE
+
+# ---------------------------------------------------------------------------
+# My PASS rules for the chosen points (all evidence from the database,
+# every sum/ratio done in SQL or Python - never by the model):
+#
+# Point 1 (market potential): 2-year revenue growth = (FY2025 - FY2023) / FY2023.
+#   PASS when the company's growth is above the median for its own industry
+#   (industry_medians.revenue_growth_2y_pct).
+# Point 2 (new products as current lines mature): share of FY2025 revenue that
+#   comes from products launched in 2023 or later. PASS when above the industry
+#   median (industry_medians.new_product_share_pct).
+# Point 5 (worthwhile profit margin): FY2025 operating margin =
+#   (revenue - cost of sales - selling & admin - R&D) / revenue. PASS when
+#   above the industry median (industry_medians.operating_margin_pct).
+#
+# Rationale: Fisher compares a company with its competitors, and the database
+# hands us exactly those industry medians. On the 20 public companies each
+# rule reproduces the expected verdicts with every company at least ~3
+# percentage points away from the line, so the rules are not knife-edge fits.
+# ---------------------------------------------------------------------------
+
+NEW_PRODUCT_SINCE = "2023-01-01"  # a product is "new" if launched in 2023+
+
+REV_BY_YEAR = (
+    "SELECT substr(order_date,1,4) AS year, SUM(amount) AS revenue "
+    "FROM orders GROUP BY year"
+)
+NEW_OLD_2025 = (
+    "SELECT CASE WHEN p.launch_date >= '%s' THEN 'new' ELSE 'old' END AS age, "
+    "SUM(o.amount) AS revenue FROM orders o JOIN products p ON o.product = p.product "
+    "WHERE substr(o.order_date,1,4) = '2025' GROUP BY age" % NEW_PRODUCT_SINCE
+)
+COSTS_BY_YEAR = (
+    "SELECT substr(month,1,4) AS year, "
+    "SUM(cost_of_sales) AS cogs, SUM(selling_admin) AS sa, "
+    "SUM(research_development) AS rd FROM monthly_costs GROUP BY year"
+)
+INDUSTRY = "SELECT industry FROM company"
+
+
+def _table(text: str) -> list[dict[str, str]]:
+    """Parse the sql_query tool's output (first line header, pipe-separated
+    rows; single-column results have no pipes) into dict rows."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) < 2 or lines[0].startswith("SQL error"):
+        return []
+    columns = [column.strip() for column in lines[0].split("|")]
+    rows = []
+    for line in lines[1:]:
+        if line.startswith("(") or line.startswith("..."):
+            continue
+        if " | " in line:
+            rows.append(dict(zip(columns, [value.strip() for value in line.split("|")])))
+        elif len(columns) == 1:
+            rows.append({columns[0]: line.strip()})
+    return rows
+
+
+def _compute_metrics(tools: dict[str, Any]) -> dict[str, float | None]:
+    """Pull the raw numbers through the sql_query tool and compute the 3 metrics."""
+    sql = tools["sql_query"].invoke
+    industry_rows = _table(sql({"query": INDUSTRY}))
+    industry = industry_rows[0]["industry"] if industry_rows else ""
+    med_rows = _table(sql({
+        "query": (
+            "SELECT revenue_growth_2y_pct, new_product_share_pct, operating_margin_pct "
+            f"FROM industry_medians WHERE industry = '{industry}'"
+        )
+    }))
+    med = med_rows[0] if med_rows else {}
+
+    revenue = {row["year"]: float(row["revenue"]) for row in _table(sql({"query": REV_BY_YEAR}))}
+    new_old = {row["age"]: float(row["revenue"]) for row in _table(sql({"query": NEW_OLD_2025}))}
+    costs = {
+        row["year"]: (float(row["cogs"]), float(row["sa"]), float(row["rd"]))
+        for row in _table(sql({"query": COSTS_BY_YEAR}))
+    }
+
+    growth_2y = None
+    if "2023" in revenue and "2025" in revenue and revenue["2023"]:
+        growth_2y = (revenue["2025"] - revenue["2023"]) / revenue["2023"] * 100
+    new_share = None
+    total_2025 = new_old.get("new", 0.0) + new_old.get("old", 0.0)
+    if total_2025:
+        new_share = new_old.get("new", 0.0) / total_2025 * 100
+    margin_2025 = None
+    if "2025" in revenue and revenue["2025"] and "2025" in costs:
+        cogs, sa, rd = costs["2025"]
+        margin_2025 = (revenue["2025"] - cogs - sa - rd) / revenue["2025"] * 100
+
+    return {
+        "industry": industry,
+        "revenue_2025_musd": round(revenue.get("2025", 0.0) / 1000, 1),
+        "growth_2y_pct": growth_2y,
+        "growth_median_pct": float(med["revenue_growth_2y_pct"]) if med else None,
+        "new_share_pct": new_share,
+        "new_share_median_pct": float(med["new_product_share_pct"]) if med else None,
+        "margin_2025_pct": margin_2025,
+        "margin_median_pct": float(med["operating_margin_pct"]) if med else None,
+    }
+
+
+def _verdicts(metrics: dict[str, float | None]) -> dict[int, str]:
+    """Apply the fixed PASS rules. Verdicts are 100% deterministic."""
+    def above(value: float | None, median: float | None) -> str:
+        if value is None or median is None:
+            return "FAIL"  # cannot verify the point -> no evidence it passes
+        return "PASS" if value > median else "FAIL"
+
+    return {
+        1: above(metrics["growth_2y_pct"], metrics["growth_median_pct"]),
+        2: above(metrics["new_share_pct"], metrics["new_share_median_pct"]),
+        5: above(metrics["margin_2025_pct"], metrics["margin_median_pct"]),
+    }
+
+
+SUMMARY_PROMPT = """You are a equity research assistant writing a short note in Philip
+Fisher's style. Here are the verified numbers for one company (all computed
+deterministically from its database, amounts in USD millions):
+
+{facts}
+
+Verdicts on three of Fisher's points:
+{verdicts}
+
+Write two or three plain sentences of summary: what the company does, and why
+each verdict follows from the numbers. No markdown, no headings, no bullet
+points - just the sentences."""
+
+
+async def _summarize(model: Any, name: str, metrics: dict[str, float | None], verdicts: dict[int, str]) -> str:
+    """One LLM call per company turns the numbers into a readable summary."""
+    def fmt(value: float | None, digits: int = 1) -> str:
+        return "n/a" if value is None else f"{value:.{digits}f}"
+
+    facts = (
+        f"Industry: {metrics['industry']}; FY2025 revenue: {metrics['revenue_2025_musd']} M USD.\n"
+        f"2-year revenue growth (FY2023 to FY2025): {fmt(metrics['growth_2y_pct'])}% "
+        f"(industry median {fmt(metrics['growth_median_pct'])}%).\n"
+        f"Share of FY2025 revenue from products launched in 2023 or later: "
+        f"{fmt(metrics['new_share_pct'])}% (industry median {fmt(metrics['new_share_median_pct'])}%).\n"
+        f"FY2025 operating margin: {fmt(metrics['margin_2025_pct'])}% "
+        f"(industry median {fmt(metrics['margin_median_pct'])}%)."
+    )
+    verdict_lines = "\n".join(
+        f"Point {point}: {verdicts[point]}" for point in CHOSEN_POINTS
+    )
+    reply = await model.ainvoke(SUMMARY_PROMPT.format(facts=facts, verdicts=verdict_lines))
+    return str(getattr(reply, "content", reply)).strip()
 
 
 def build_agent() -> Any:
@@ -71,8 +220,9 @@ def build_agent() -> Any:
     from .env. Each company has its own tools (see ``analyze_companies``), so
     you will probably create one tool-calling agent per company there.
     """
-    ### YOUR CODE HERE
-    return None
+    from langchain_deepseek import ChatDeepSeek
+
+    return ChatDeepSeek(model=MODEL_NAME, temperature=0.0, max_retries=3)
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -108,9 +258,38 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     entry for it: an exception here means no results.csv, which scores zero.
     You may analyse companies in parallel (e.g. ``asyncio.gather``).
     """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    async def analyze_one(name: str, tool_list: list[Any]) -> dict[str, Any]:
+        """One company: deterministic verdicts from the database, LLM only
+        for the summary. Any failure still returns a valid entry."""
+        try:
+            tools = {tool.name: tool for tool in tool_list}
+            metrics = _compute_metrics(tools)
+            verdicts = _verdicts(metrics)
+        except Exception as exc:
+            print(f"warning: data read failed for {name}: {exc!r}", flush=True)
+            metrics = {"industry": "unknown"}
+            verdicts = {point: "FAIL" for point in CHOSEN_POINTS}
+        summary = ""
+        try:
+            for attempt in range(3):
+                try:
+                    summary = await _summarize(agent, name, metrics, verdicts)
+                    if summary:
+                        break
+                except Exception:
+                    if attempt < 2:
+                        await asyncio.sleep(2 * (attempt + 1))
+        except Exception:
+            summary = ""
+        if not summary:
+            bits = [f"{point}: {verdicts[point]}" for point in CHOSEN_POINTS]
+            summary = f"Verdicts ({'; '.join(bits)}) computed from the company database."
+        return {"points": verdicts, "summary": summary}
+
+    analyses = await asyncio.gather(
+        *(analyze_one(name, tool_list) for name, tool_list in companies.items())
+    )
+    return dict(zip(companies, analyses))
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
